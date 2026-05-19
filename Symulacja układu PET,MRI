@@ -1,0 +1,214 @@
+# ===========================================================================================
+# PROJECT: PET/MRI Multi-Parametric Simulator (Julia)
+# REPOSITORY: https://github.com/MichalGalkowski/PET-MRI-Simulation-Analysis
+# 
+# OPIS TECHNICZNY:
+# Interaktywny symulator numeryczny modelujący fizykę detekcji pozytonowej (PET) 
+# w obecności zakłóceń indukowanych przez pole magnetyczne (MRI). 
+#
+# KLUCZOWE FUNKCJE:
+# 1. Model Monte Carlo: Generowanie zdarzeń anihilacji zgodnie z rozkładem Poissona.
+# 2. Model ToF (Time-of-Flight): Symulacja rozdzielczości czasowej detektorów.
+# 3. Model EMI (MRI Noise): Sinusoidalne zakłócenia linii bazowej sygnału (50Hz).
+# 4. DSP & ADC: Modelowanie wzmocnienia, szumu termicznego oraz kwantyzacji bitowej.
+# 5. Geometria LOR: Wizualizacja linii odpowiedzi (Lines of Response) w pierścieniu detektorów.
+#
+# WYMAGANE BIBLIOTEKI: GLMakie, Distributions, Statistics, Random, Observables
+# ===========================================================================================
+
+using GLMakie
+using Distributions
+using Statistics
+using Random
+using Observables
+
+# =========================
+# Parametry wejściowe (Observable) - Reaktywne zmienne sterujące GUI
+# =========================
+czestotliwosc = Observable(500.0)    # Średnia liczba zliczeń na sekundę [Hz]
+szum          = Observable(0.05)     # Amplituda szumu gaussowskiego [V]
+prog_detekcji = Observable(0.5)      # Próg komparatora [V]
+pole_B        = Observable(1.0)      # Natężenie pola magnetycznego (wpływ na EMI) [T]
+wzmocnienie   = Observable(10.0)     # Wzmocnienie toru analogowego
+stala_tau     = Observable(1e-4)     # Czas zaniku scyntylatora [s]
+probkowanie   = Observable(5e4)      # Częstotliwość próbkowania ADC [Hz]
+monte_carlo   = Observable(50)       # Liczba powtórzeń symulacji (statystyka)
+liczba_detekt = Observable(16)       # Liczba bloków detekcyjnych w pierścieniu
+promien       = Observable(1.0)      # Promień skanera [m]
+tof_rozdz     = Observable(0.0005)   # Rozdzielczość czasowa ToF (sigma rozkładu) [s]
+adc_bity      = Observable(12)       # Rozdzielczość bitowa przetwornika ADC
+vref_adc      = Observable(3.3)      # Napięcie referencyjne ADC [V]
+przesuniecie  = Observable(0.0)      # Przesunięcie czasowe wykresu [s]
+
+# =========================
+# Funkcje pomocnicze (Matematyka Systemu)
+# =========================
+
+# Wyznacza współrzędne (x, y) detektorów na okręgu
+function pozycje_detektorow(N, R)
+    katy = range(0, 2π, length=N+1)[1:end-1]
+    [Point2f(R*cos(a), R*sin(a)) for a in katy]
+end
+
+# Symuluje proces dyskretyzacji sygnału przez ADC
+function kwantyzacja_adc(sygnal, bity, vref)
+    poziomy = 2^bity
+    krok = vref / poziomy
+    round.(sygnal ./ krok) .* krok
+end
+
+# Oblicza lokalny stosunek sygnału do szumu dla wykrytych impulsów
+function oblicz_snr(sygnal, prawda)
+    σ = std(sygnal) + 1e-6
+    [prawda[i] ? sygnal[i] / σ : 0.0 for i in eachindex(sygnal)]
+end
+
+# =========================
+# Główna funkcja symulacji (Silnik Fizyczny)
+# =========================
+function symuluj()
+    Ndet = liczba_detekt[]
+    R = promien[]
+    det_pos = pozycje_detektorow(Ndet, R)
+    t = collect(0:1/probkowanie[]:0.02) # Okno czasowe 20ms
+    N = length(t)
+    sygnal = zeros(N)
+    prawda = falses(N) # Flagi rzeczywistych zdarzeń (Ground Truth)
+    lors = Point2f[] 
+
+    # Okno czasowe impulsu (5-krotność stałej czasowej)
+    okno = Int(round(5 * stala_tau[] * probkowanie[]))
+
+    # --- Symulacja zdarzeń metodą Monte Carlo ---
+    for r in 1:monte_carlo[]
+        # Liczba zdarzeń w oknie czasowym zgodnie z rozkładem Poissona
+        n_zdarzen = max(1, rand(Poisson(czestotliwosc[] * maximum(t) / 10)))
+        for _ in 1:n_zdarzen
+            # Losowanie pary detektorów (koincydencja)
+            d1 = rand(1:Ndet)
+            d2 = mod(d1 + Ndet ÷ 2 + rand(-1:1) - 1, Ndet) + 1
+            
+            # Modelowanie błędu ToF (Time of Flight) rozkładem Normalnym
+            dt = rand(Normal(0, tof_rozdz[])) 
+            t0 = rand() * (maximum(t) * 0.7)
+            
+            idx1 = Int(round(t0 * probkowanie[]))
+            idx2 = Int(round((t0 + dt) * probkowanie[]))
+            
+            # Generowanie kształtu impulsu (wykładniczy zanik)
+            if idx1 > 0 && idx1 + okno < N && idx2 > 0 && idx2 + okno < N
+                for k in 0:okno
+                    val = exp(-k / (stala_tau[] * probkowanie[]))
+                    sygnal[idx1 + k] += val
+                    sygnal[idx2 + k] += val
+                end
+                prawda[idx1] = true
+                prawda[idx2] = true
+            end
+        end
+    end
+
+    # --- Modelowanie zakłóceń i elektroniki ---
+    # 1. Wzmocnienie + Szum termiczny + Zakłócenie MRI (sinus 50Hz od pola B)
+    calkowity = (wzmocnienie[] .* sygnal) .+ 
+                (randn(N) .* szum[]) .+ 
+                (0.1 * pole_B[] .* sin.(2π * 50 .* t))
+    
+    # 2. Nasycenie wzmacniacza (Clamping)
+    calkowity = clamp.(calkowity, 0, vref_adc[])
+    
+    # 3. Kwantyzacja ADC (wpływ rozdzielczości bitowej)
+    calkowity = kwantyzacja_adc(calkowity, adc_bity[], vref_adc[])
+    
+    # --- Logika detekcji LOR (Lines of Response) ---
+    # Identyfikacja maksimów lokalnych powyżej progu
+    for i in 2:N-1
+        if calkowity[i] > prog_detekcji[] && calkowity[i] > calkowity[i-1] && calkowity[i] > calkowity[i+1]
+            d_idx = rand(1:Ndet)
+            opp_idx = mod(d_idx + Ndet ÷ 2 - 1, Ndet) + 1
+            push!(lors, det_pos[d_idx])
+            push!(lors, det_pos[opp_idx])
+        end
+    end
+    
+    return t, calkowity, prawda, det_pos, lors
+end
+
+# =========================
+# Interfejs Graficzny (GUI Makie)
+# =========================
+fig = Figure(size=(1400, 1000), backgroundcolor=:gray90)
+uklad_wykresow = fig[1, 1] = GridLayout()
+uklad_kontroli = fig[2, 1] = GridLayout()
+
+ax_sygnal = Axis(uklad_wykresow[1, 1], title="Sygnał detektora [V]", xlabel="Czas [s]", ylabel="Napięcie [V]")
+ax_snr    = Axis(uklad_wykresow[2, 1], title="Stosunek Sygnału do Szumu (SNR)", xlabel="Czas [s]", ylabel="SNR")
+ax_geom   = Axis(uklad_wykresow[1:2, 2], title="Geometria PET (Linie LOR)", aspect=DataAspect())
+
+# Wizualizacja progu detekcji
+hlines!(ax_sygnal, prog_detekcji, color=:red, linestyle=:dash)
+
+# Inicjalizacja obserwowalnych danych wykresów
+sig_x = Observable(Float64[])
+sig_y = Observable(Float64[])
+snr_y = Observable(Float64[])
+det_points = Observable(Point2f[])
+lor_segments = Observable(Point2f[])
+
+# Rysowanie elementów dynamicznych
+lines!(ax_sygnal, sig_x, sig_y, color=:blue)
+lines!(ax_snr, sig_x, snr_y, color=:green)
+scatter!(ax_geom, det_points, color=:red, markersize=15)
+linesegments!(ax_geom, lor_segments, color=(:orange, 0.3))
+
+# Funkcja odświeżająca widok po zmianie parametrów
+function odswiez!()
+    t, sig, prawda, det_pos, lors = symuluj()
+    sig_x[] = t .+ przesuniecie[]
+    sig_y[] = sig
+    snr_y[] = oblicz_snr(sig, prawda)
+    det_points[] = det_pos
+    lor_segments[] = lors
+    
+    autolimits!(ax_sygnal)
+    autolimits!(ax_snr)
+    R = promien[]
+    limits!(ax_geom, -R*1.2, R*1.2, -R*1.2, R*1.2)
+end
+
+# Panel sterowania (Suwaki)
+sg = SliderGrid(
+    uklad_kontroli[1, 1],
+    (label = "Częstotliwość [Hz]", range = 100:100:2000, startvalue = czestotliwosc[]),
+    (label = "Szum [V]", range = 0:0.01:0.3, startvalue = szum[]),
+    (label = "Próg Detekcji [V]", range = 0.1:0.1:3.0, startvalue = prog_detekcji[]),
+    (label = "Pole B [T]", range = 0:0.1:5, startvalue = pole_B[]),
+    (label = "Wzmocnienie", range = 1:1:40, startvalue = wzmocnienie[]),
+    (label = "Stała Tau [s]", range = 1e-5:1e-5:5e-4, startvalue = stala_tau[]),
+    (label = "Próbkowanie [Hz]", range = 1e4:5e3:1e5, startvalue = probkowanie[]),
+    (label = "Monte Carlo", range = 10:10:200, startvalue = monte_carlo[]),
+    (label = "Liczba Detektorów", range = 8:2:64, startvalue = liczba_detekt[]),
+    (label = "Promień [m]", range = 0.5:0.1:2.0, startvalue = promien[]),
+    (label = "ToF σ [s]", range = 1e-5:1e-4:2e-3, startvalue = tof_rozdz[]),
+    (label = "Bity ADC", range = 4:1:16, startvalue = adc_bity[]),
+    (label = "Przesunięcie [s]", range = -0.01:0.001:0.01, startvalue = przesuniecie[])
+)
+
+# Powiązanie suwaków z logiką odświeżania
+lista_obs = [czestotliwosc, szum, prog_detekcji, pole_B, wzmocnienie, stala_tau, probkowanie, monte_carlo, liczba_detekt, promien, tof_rozdz, adc_bity, przesuniecie]
+for (i, s) in enumerate(sg.sliders)
+    on(s.value) do v
+        lista_obs[i][] = v
+        odswiez!()
+    end
+end
+
+# Przycisk wymuszający nową iterację Monte Carlo
+btn = Button(uklad_kontroli[1, 2], label="Nowa Symulacja", width=150)
+on(btn.clicks) do _
+    odswiez!()
+end
+
+# Start aplikacji
+odswiez!()
+display(fig)
