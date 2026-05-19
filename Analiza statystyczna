@@ -1,0 +1,123 @@
+# ===========================================================================================
+# PROJECT: PET Data Stream Statistical Analyzer (R)
+# REPOSITORY: https://github.com/MichalGalkowski/PET-MRI-Simulation-Analysis
+# 
+# OPIS TECHNICZNY:
+# Skrypt R dedykowany do zaawansowanej analizy statystycznej i post-processingu danych 
+# z detektorów PET. Skupia się na weryfikacji teoretycznych modeli fizycznych 
+# w oparciu o zarejestrowane strumienie danych.
+#
+# KLUCZOWE FUNKCJE:
+# 1. Regex Parsing: Wykorzystanie wyrażeń regularnych do ekstrakcji danych z logów tekstowych.
+# 2. Randoms Estimation: Obliczanie teoretycznej liczby koincydencji przypadkowych 
+#    na podstawie wzoru: R_random = 2 * tau * R1 * R2.
+# 3. True Coincidence Estimation: Estymacja rzeczywistych zdarzeń anihilacji 
+#    poprzez odjęcie tła przypadkowego od zmierzonych koincydencji.
+# 4. Analiza Korelacji: Testy statystyczne (Pearson) badające zależność między 
+#    aktywnością źródła a wydajnością detekcji.
+#
+# WYMAGANE BIBLIOTEKI: tidyverse, ggplot2, stringr
+# ===========================================================================================
+
+# --- 1. Instalacja i ładowanie bibliotek ---
+if (!require("tidyverse")) install.packages("tidyverse")
+if (!require("ggplot2")) install.packages("ggplot2")
+if (!require("stringr")) install.packages("stringr")
+
+library(tidyverse)
+library(ggplot2)
+library(stringr)
+
+# --- 2. Funkcja analizy danych PET ---
+# Funkcja przyjmuje ścieżkę do pliku tekstowego wygenerowanego przez system DAQ.
+analiza_pet <- function(sciezka_do_pliku) {
+  
+  # Wczytanie surowych linii tekstu z pliku logu
+  surowe_linie <- readLines(sciezka_do_pliku)
+  
+  # Parsowanie danych przy użyciu wyrażeń regularnych (Lookbehind)
+  # Oczekiwany format: RAW1:123 RAW2:456 COINC:78 WIN:10
+  df <- data.frame(
+    raw_ch1 = as.numeric(str_extract(surowe_linie, "(?<=RAW1:)\\d+")),
+    raw_ch2 = as.numeric(str_extract(surowe_linie, "(?<=RAW2:)\\d+")),
+    coinc   = as.numeric(str_extract(surowe_linie, "(?<=COINC:)\\d+")),
+    window  = as.numeric(str_extract(surowe_linie, "(?<=WIN:)\\d+"))
+  ) %>% 
+    na.omit()  # Usunięcie linii niekompletnych lub nagłówkowych
+  
+  # Dodanie indeksu porządkowego (krok czasowy)
+  df$time_step <- 1:nrow(df)
+  
+  # --- 3. Obliczenia statystyczno-fizyczne ---
+  interwal_sekundy <- 5 # Czas trwania jednej ramki pomiarowej
+  
+  df <- df %>%
+    mutate(
+      # Obliczanie tempa zliczeń (Counts per Second - CPS)
+      rate_ch1 = raw_ch1 / interwal_sekundy,
+      rate_ch2 = raw_ch2 / interwal_sekundy,
+      
+      # Konwersja okna koincydencji z mikrosekund na sekundy
+      tau_sekundy = window / 1e6,  
+      
+      # Obliczanie teoretycznej liczby koincydencji przypadkowych (Random Coincidences)
+      # Wynika z prawdopodobieństwa nałożenia się dwóch niezależnych zdarzeń w oknie 2*tau
+      randoms_teoretyczne = 2 * tau_sekundy * rate_ch1 * rate_ch2,
+      
+      # Estymacja koincydencji prawdziwych (True Coincidences)
+      true_coinc_est = coinc - randoms_teoretyczne
+    )
+  
+  # --- 4. Testy statystyczne ---
+  # Sprawdzenie korelacji między aktywnością kanału a liczbą koincydencji
+  test_korelacji <- cor.test(df$raw_ch1, df$coinc)
+  print("--- WYNIK TESTU KORELACJI PEARSONA ---")
+  print(test_korelacji)
+  
+  # --- 5. Wizualizacje danych (ggplot2) ---
+  
+  # Wykres 1: Przebieg czasowy zliczeń surowych i koincydencji
+  p1 <- ggplot(df, aes(x = time_step)) +
+    geom_line(aes(y = raw_ch1, color = "Kanał 1 (Raw)"), size = 1) +
+    geom_line(aes(y = coinc, color = "Koincydencje"), size = 1) +
+    labs(title = "Dynamika Strumienia Danych PET",
+         x = "Krok pomiarowy (t)", y = "Liczba zliczeń",
+         color = "Legenda") +
+    theme_minimal()
+  
+  # Wykres 2: Porównanie zmierzonych koincydencji z modelem teoretycznym Randoms
+  p2 <- ggplot(df, aes(x = time_step)) +
+    geom_area(aes(y = coinc, fill = "Zmierzone (Total)"), alpha = 0.4) +
+    geom_line(aes(y = randoms_teoretyczne, color = "Przypadkowe (Model Teoretyczny)"),
+              linetype = "dashed", size = 1) +
+    labs(title = "Analiza Tła: Zmierzone vs Przypadkowe",
+         x = "Krok pomiarowy", y = "Zliczenia",
+         fill = "Obszar", color = "Linia") +
+    theme_light()
+  
+  # Wykres 3: Histogram rozkładu estymowanych koincydencji prawdziwych
+  p3 <- ggplot(df, aes(x = true_coinc_est)) +
+    geom_histogram(bins = 30, fill = "darkgreen", color = "white") +
+    labs(title = "Rozkład statystyczny koincydencji prawdziwych",
+         x = "Estymowana liczba True Coincidences", y = "Częstość") +
+    theme_classic()
+  
+  # Wyświetlenie wykresów
+  print(p1)
+  print(p2)
+  print(p3)
+  
+  return(df)
+}
+
+# --- 6. URUCHOMIENIE ANALIZY ---
+# Ścieżka do pliku z danymi (należy dostosować do lokalnego środowiska)
+sciezka <- "C:\\Users\\galko\\OneDrive\\Dokumenty\\Fizyka medyczna UG\\Programy\\Python\\Microsoft VS Code\\ai_env\\projects\\PETMRI\\test_sim.txt"
+
+# Sprawdzenie czy plik istnieje przed uruchomieniem
+if (file.exists(sciezka)) {
+  wyniki <- analiza_pet(sciezka)
+  print("Analiza zakończona pomyślnie.")
+} else {
+  print("BŁĄD: Nie znaleziono pliku pod wskazaną ścieżką.")
+}
