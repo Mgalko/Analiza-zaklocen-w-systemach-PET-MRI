@@ -1,0 +1,174 @@
+"""
+===========================================================================================
+PROJECT: Real-Time PET/MRI Data Logger & Visualizer (Python)
+REPOSITORY: https://github.com/MichalGalkowski/PET-MRI-Simulation-Analysis
+
+OPIS TECHNICZNY:
+Aplikacja desktopowa służąca do mostkowania komunikacji między mikrokontrolerem ESP32 
+a systemem plików. Realizuje ona trzy kluczowe zadania:
+1. Akwizycja danych: Odczyt strumienia CSV przez interfejs szeregowy (UART).
+2. Archiwizacja: Zapis surowych danych pomiarowych do plików tekstowych z unikalnym 
+   znacznikiem czasu (timestamp), co zapobiega nadpisywaniu wyników.
+3. Wizualizacja Live: Dynamiczny wykres (sliding window) prezentujący aktywność 
+   kanałów detekcyjnych w czasie rzeczywistym.
+
+KLUCZOWE FUNKCJE:
+- Automatyczne zarządzanie plikami pomiarowymi.
+- Odporność na błędy transmisji (try-except parsing).
+- Dynamiczne skalowanie osi wykresu w zależności od intensywności zliczeń.
+- Separacja danych pomiarowych od komunikatów statusowych ESP32 (linie zaczynające się od '#').
+
+WYMAGANE BIBLIOTEKI: pyserial, matplotlib
+===========================================================================================
+"""
+
+import serial
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+import datetime
+import os
+
+# =========================================================
+# KONFIGURACJA SYSTEMOWA
+# =========================================================
+
+SERIAL_PORT = 'COM6'  # Port, pod którym widoczny jest ESP32
+BAUD_RATE = 115200    # Prędkość transmisji (musi być zgodna z Serial.begin w ESP32)
+
+# Ścieżka do folderu zapisu wyników
+SAVE_FOLDER = r"C:\Users\galko\OneDrive\Dokumenty\Fizyka medyczna UG\Programy\Python\Microsoft VS Code\ai_env\projects\PETMRI"
+
+# Generowanie unikalnej nazwy pliku na podstawie aktualnej daty i godziny
+timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+FILE_NAME = os.path.join(SAVE_FOLDER, f"pomiar_{timestamp}.txt")
+
+# =========================================================
+# INICJALIZACJA STRUKTUR DANYCH
+# =========================================================
+
+raw_values = []      # Bufor dla danych z Kanału 1
+filtered_values = [] # Bufor dla danych z Kanału 2 (lub przefiltrowanych)
+max_points = 100     # Liczba próbek widocznych jednocześnie na wykresie
+
+# =========================
+# POŁĄCZENIE SZEREGOWE (UART)
+# =========================
+
+try:
+    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+    print(f"\n[OK] Połączono z {SERIAL_PORT}")
+    print(f"[INFO] Dane będą zapisywane w: {FILE_NAME}\n")
+except Exception as e:
+    print(f"[BŁĄD] Nie można otworzyć portu {SERIAL_PORT}: {e}")
+    exit()
+
+# =========================
+# PRZYGOTOWANIE PLIKU LOGU
+# =========================
+
+try:
+    if not os.path.exists(SAVE_FOLDER):
+        os.makedirs(SAVE_FOLDER)
+        
+    with open(FILE_NAME, "a") as f:
+        f.write("=====================================\n")
+        f.write(f"SESJA POMIAROWA: {datetime.datetime.now()}\n")
+        f.write("Format: Timestamp_US, CH1_Raw, CH2_Raw, Coincidences\n")
+        f.write("=====================================\n")
+except Exception as e:
+    print(f"[BŁĄD] Problem z dostępem do folderu zapisu: {e}")
+    exit()
+
+# =========================================================
+# KONFIGURACJA GRAFICZNA (Matplotlib)
+# =========================================================
+
+fig, ax = plt.subplots(figsize=(10, 5))
+plt.subplots_adjust(bottom=0.2)
+
+line_raw, = ax.plot([], [], label='Kanał 1 (CH1)', color='blue', alpha=0.7)
+line_filt, = ax.plot([], [], label='Kanał 2 (CH2)', color='red', alpha=0.7)
+
+ax.set_ylim(0, 100) # Wstępny zakres, będzie skalowany dynamicznie
+ax.set_xlim(0, max_points)
+ax.set_title("Monitor Akwizycji PET/MRI (Live Stream)")
+ax.set_xlabel("Próbki (Ostatnie 100)")
+ax.set_ylabel("Liczba zliczeń")
+ax.grid(True, linestyle=':', alpha=0.6)
+ax.legend(loc='upper left')
+
+# =========================================================
+# FUNKCJA AKTUALIZACJI (Główna pętla wizualizacji)
+# =========================================================
+
+def update(frame):
+    """Funkcja wywoływana cyklicznie przez FuncAnimation."""
+    if ser.in_waiting > 0:
+        try:
+            # Odczyt linii z portu szeregowego
+            line = ser.readline().decode('utf-8', errors='ignore').strip()
+
+            # 1. Obsługa komunikatów statusowych (zaczynających się od #)
+            if not line:
+                return line_raw, line_filt
+            
+            if line.startswith('#'):
+                print(f"[ESP32 STATUS]: {line}")
+                return line_raw, line_filt
+
+            # 2. Archiwizacja surowych danych CSV do pliku
+            with open(FILE_NAME, "a") as f:
+                f.write(line + "\n")
+
+            # 3. Parsowanie danych (Format: ts, ch1, ch2, coinc)
+            parts = line.split(',')
+            if len(parts) == 4:
+                val_ch1 = float(parts[1])
+                val_ch2 = float(parts[2])
+                coinc   = float(parts[3])
+
+                # Dodawanie nowych punktów do buforów kołowych
+                raw_values.append(val_ch1)
+                filtered_values.append(val_ch2)
+
+                # Mechanizm przesuwnego okna (Sliding Window)
+                if len(raw_values) > max_points:
+                    raw_values.pop(0)
+                    filtered_values.pop(0)
+
+                # Aktualizacja danych na wykresie
+                x_axis = range(len(raw_values))
+                line_raw.set_data(x_axis, raw_values)
+                line_filt.set_data(x_axis, filtered_values)
+
+                # Dynamiczne dopasowanie osi Y do amplitudy sygnału
+                ax.relim()
+                ax.autoscale_view(scalex=False, scaley=True)
+                
+                # Logowanie do konsoli dla podglądu bieżącego
+                print(f"T: {parts[0]}us | CH1: {val_ch1} | CH2: {val_ch2} | COINC: {coinc}")
+
+        except Exception as e:
+            print(f"[BŁĄD PARSOWANIA]: {e}")
+
+    return line_raw, line_filt
+
+# =========================================================
+# URUCHOMIENIE ANIMACJI I GUI
+# =========================================================
+
+# Interwał 10ms zapewnia płynność przy 115200 baud
+ani = FuncAnimation(fig, update, interval=10, blit=False, cache_frame_data=False)
+
+try:
+    plt.show()
+except KeyboardInterrupt:
+    print("\n[INFO] Zatrzymano przez użytkownika.")
+
+# =========================
+# ZAMKNIĘCIE ZASOBÓW
+# =========================
+
+ser.close()
+print("\n[INFO] Port szeregowy zamknięty.")
+print(f"[INFO] Wszystkie dane zostały bezpiecznie zapisane w:\n{FILE_NAME}")
