@@ -1,1 +1,1 @@
-# Analiza-zak-ce-w-systemach-PET-MRI
+# Analiza-zaklocen-w-systemach-PET-MRI
